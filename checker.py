@@ -1,3 +1,4 @@
+import multiprocessing
 import os
 import re
 import sys
@@ -32,6 +33,7 @@ STORES = [
 
 BLOCK_INDICATORS = [
     "access denied",
+    "you don't have permission to access",
     "robot check",
     "enter the characters you see below",
     "pardon our interruption",
@@ -104,11 +106,85 @@ def is_in_stock(page, store_type: str) -> bool:
     return False
 
 
-def get_safe_html(page) -> str:
+def check_single_store(store: dict, result_queue: multiprocessing.Queue) -> None:
+    name = store["name"]
+    url = store["url"]
+    store_type = store["type"]
+
     try:
-        return page.content()[:5000].lower()
-    except Exception:
-        return ""
+        with sync_playwright() as p:
+            browser = p.chromium.launch(
+                headless=True,
+                args=[
+                    "--disable-blink-features=AutomationControlled",
+                    "--disable-http2",
+                    "--no-sandbox",
+                    "--disable-dev-shm-usage",
+                ],
+            )
+            context = browser.new_context(
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/131.0.0.0 Safari/537.36"
+                ),
+                viewport={"width": 1366, "height": 768},
+                locale="en-US",
+            )
+            context.set_default_timeout(5000)
+            context.add_init_script(
+                "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
+            )
+
+            page = context.new_page()
+            # Block heavy media/fonts so pages load fast and don't stall memory
+            page.route(
+                re.compile(r"\.(png|jpg|jpeg|gif|webp|svg|mp4|woff|woff2)(\?.*)?$", re.I),
+                lambda route: route.abort(),
+            )
+
+            try:
+                response = page.goto(url, wait_until="domcontentloaded", timeout=14000)
+                page.wait_for_timeout(3500)
+                status = response.status if response else "No response"
+            except PlaywrightTimeout:
+                status = "Partial load"
+
+            html_snippet = ""
+            try:
+                html_snippet = page.content()[:5000].lower()
+            except Exception:
+                pass
+
+            if any(flag in html_snippet for flag in BLOCK_INDICATORS):
+                result_queue.put({
+                    "in_stock": False,
+                    "log": f"[{name}] BLOCKED / CAPTCHA detected (HTTP {status}).",
+                    "summary": f"• **{name}**: Blocked / CAPTCHA (HTTP {status})",
+                })
+                return
+
+            if is_in_stock(page, store_type):
+                result_queue.put({
+                    "in_stock": True,
+                    "log": f"[{name}] IN STOCK! Sending Discord alert...",
+                    "summary": f"• **{name}**: **IN STOCK!**",
+                })
+            else:
+                result_queue.put({
+                    "in_stock": False,
+                    "log": f"[{name}] Out of stock (HTTP {status}).",
+                    "summary": f"• **{name}**: Out of stock",
+                })
+
+            browser.close()
+
+    except Exception as err:
+        result_queue.put({
+            "in_stock": False,
+            "log": f"[{name}] Error: {err}",
+            "summary": f"• **{name}**: Error",
+        })
 
 
 def check_all_stores() -> None:
@@ -118,83 +194,38 @@ def check_all_stores() -> None:
 
     status_report = []
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch(
-            headless=True,
-            args=[
-                "--disable-blink-features=AutomationControlled",
-                "--disable-http2",
-            ],
-        )
-        context = browser.new_context(
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/131.0.0.0 Safari/537.36"
-            ),
-            viewport={"width": 1366, "height": 768},
-            locale="en-US",
-        )
-        context.set_default_timeout(5000)
-        context.add_init_script(
-            "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
-        )
+    for store in STORES:
+        name = store["name"]
+        url = store["url"]
+        print(f"[{name}] Checking...", flush=True)
 
-        for store in STORES:
-            name = store["name"]
-            url = store["url"]
-            store_type = store["type"]
-            print(f"[{name}] Checking...", flush=True)
-            page = None
-            timed_out = False
+        q = multiprocessing.Queue()
+        proc = multiprocessing.Process(target=check_single_store, args=(store, q))
+        proc.start()
+        proc.join(timeout=22)
 
-            try:
-                page = context.new_page()
-                response = page.goto(url, wait_until="domcontentloaded", timeout=15000)
-                page.wait_for_timeout(4000)
+        if proc.is_alive():
+            proc.terminate()
+            proc.join(timeout=3)
+            if proc.is_alive():
+                proc.kill()
+            print(f"[{name}] Timed out (hard stop after 22s).", flush=True)
+            status_report.append(f"• **{name}**: Timed out (blocked cloud IP)")
+        elif not q.empty():
+            res = q.get_nowait()
+            print(res["log"], flush=True)
+            status_report.append(res["summary"])
+            if res["in_stock"]:
+                send_stock_alert(name, url)
+        else:
+            print(f"[{name}] Process exited unexpectedly.", flush=True)
+            status_report.append(f"• **{name}**: Error")
 
-                status = response.status if response else "No response"
-                html_snippet = get_safe_html(page)
+    if EVENT_NAME == "workflow_dispatch":
+        print("Manual run detected. Sending summary to Discord...", flush=True)
+        send_manual_summary(status_report)
 
-                if any(flag in html_snippet for flag in BLOCK_INDICATORS):
-                    print(f"[{name}] BLOCKED / CAPTCHA detected (HTTP {status}).", flush=True)
-                    status_report.append(f"• **{name}**: Blocked / CAPTCHA (HTTP {status})")
-                    continue
-
-                if is_in_stock(page, store_type):
-                    print(f"[{name}] IN STOCK! Sending Discord alert...", flush=True)
-                    send_stock_alert(name, url)
-                    status_report.append(f"• **{name}**: **IN STOCK!**")
-                else:
-                    print(f"[{name}] Out of stock (HTTP {status}).", flush=True)
-                    status_report.append(f"• **{name}**: Out of stock")
-
-            except PlaywrightTimeout:
-                timed_out = True
-                if page and is_in_stock(page, store_type):
-                    print(f"[{name}] IN STOCK! Sending Discord alert...", flush=True)
-                    send_stock_alert(name, url)
-                    status_report.append(f"• **{name}**: **IN STOCK!**")
-                else:
-                    print(f"[{name}] Timed out loading page.", flush=True)
-                    status_report.append(f"• **{name}**: Timed out")
-            except Exception as err:
-                print(f"[{name}] Error: {err}", flush=True)
-                status_report.append(f"• **{name}**: Error")
-            finally:
-                if page and not timed_out:
-                    try:
-                        page.close()
-                    except Exception:
-                        pass
-
-        if EVENT_NAME == "workflow_dispatch":
-            print("Manual run detected. Sending summary to Discord...", flush=True)
-            send_manual_summary(status_report)
-
-        print("All checks finished.", flush=True)
-        sys.stdout.flush()
-        os._exit(0)
+    print("All checks finished.", flush=True)
 
 
 if __name__ == "__main__":
