@@ -120,8 +120,9 @@ def check_all_stores() -> None:
 
             try:
                 page = context.new_page()
-                response = page.goto(url, wait_until="domcontentloaded", timeout=30000)
-                page.wait_for_timeout(4000)
+                wait_mode = "commit" if store_type == "bestbuy" else "domcontentloaded"
+                response = page.goto(url, wait_until=wait_mode, timeout=30000)
+                page.wait_for_timeout(6000 if store_type == "bestbuy" else 4000)
 
                 status = response.status if response else "No response"
                 title = page.title().lower()
@@ -138,7 +139,11 @@ def check_all_stores() -> None:
                     print(f"[{name}] Out of stock (HTTP {status}).")
 
             except PlaywrightTimeout:
-                print(f"[{name}] Timed out loading page.")
+                if page and is_in_stock(page, store_type):
+                    print(f"[{name}] IN STOCK! Sending Discord alert...")
+                    send_notification(name, url)
+                else:
+                    print(f"[{name}] Timed out loading page (store may be blocking cloud IPs).")
             except Exception as err:
                 print(f"[{name}] Error: {err}")
             finally:
