@@ -34,7 +34,7 @@ STORES = [
         "type": "amazon",
     },
     {
-        "name": "GameStop (480 N Hwy 90 Byp, Sierra Vista)",
+        "name": "GameStop (Sierra Vista - In-Store)",
         "url": "https://www.gamestop.com/consoles-hardware/nintendo-switch-2/products/nintendo-switch-2-the-legend-of-zelda-40th-anniversary-edition/451607.html",
         "type": "gamestop",
     },
@@ -96,86 +96,89 @@ def dismiss_popups(page) -> None:
             pass
 
 
-def check_gamestop_local(page) -> tuple[bool, str]:
-    """Selects 480 N Highway 90 Byp Ste A3, Sierra Vista, AZ 85635 and checks pickup status."""
+def set_and_search_gamestop_store(page) -> None:
+    """Opens GameStop's store selector/availability modal and searches 85635."""
     try:
-        dismiss_popups(page)
-
-        # Activate the "Pick Up in Store" fulfillment option if it is collapsed/unselected
-        pickup_tab = page.locator(
-            'button:visible, label:visible, [role="radio"]:visible, [role="tab"]:visible'
-        ).filter(has_text=re.compile(r"(pick up in store|store pickup|free store pickup)", re.I))
-        if pickup_tab.count() > 0:
-            try:
-                pickup_tab.first.click(timeout=2000)
-                page.wait_for_timeout(1200)
-            except Exception:
-                pass
-
-        body_text = page.locator("body").inner_text().lower()
-
-        if "480 n highway 90" not in body_text and "sierra vista" not in body_text:
-            store_triggers = page.locator('button:visible, [role="button"]:visible').filter(
-                has_text=re.compile(
-                    r"(select a store|set store|change store|check other stores|check availability|find a store)",
-                    re.I,
-                )
+        triggers = page.locator('button:visible, a:visible, [role="button"]:visible').filter(
+            has_text=re.compile(
+                r"(check store availability|find in store|select a store|set store|change store|check other stores)",
+                re.I,
             )
-            if store_triggers.count() > 0:
+        )
+        if triggers.count() > 0:
+            triggers.first.click(timeout=2500)
+            page.wait_for_timeout(1200)
+
+        zip_input = page.locator(
+            'input[placeholder*="zip" i]:visible, '
+            'input[placeholder*="city" i]:visible, '
+            'input[placeholder*="postal" i]:visible, '
+            'input[name*="zip" i]:visible, '
+            'input[id*="zip" i]:visible, '
+            'input[aria-label*="zip" i]:visible'
+        )
+        if zip_input.count() > 0:
+            zip_input.first.fill(LOCAL_ZIP)
+            zip_input.first.press("Enter")
+            search_btn = page.locator("button:visible").filter(
+                has_text=re.compile(r"^(search|find|submit|apply|update|check)$", re.I)
+            )
+            if search_btn.count() > 0:
                 try:
-                    store_triggers.first.click(timeout=3000)
+                    search_btn.first.click(timeout=1500)
+                except Exception:
+                    pass
+            page.wait_for_timeout(2200)
+
+            make_my_store = page.locator("button:visible").filter(
+                has_text=re.compile(r"(make my store|set as my store|set store|select store)", re.I)
+            )
+            if make_my_store.count() > 0:
+                try:
+                    make_my_store.first.click(timeout=1500)
                     page.wait_for_timeout(1500)
                 except Exception:
                     pass
+    except Exception:
+        pass
 
-            zip_input = page.locator(
-                'input[placeholder*="zip" i]:visible, '
-                'input[placeholder*="city" i]:visible, '
-                'input[placeholder*="postal" i]:visible, '
-                'input[name*="zip" i]:visible, '
-                'input[id*="zip" i]:visible, '
-                'input[aria-label*="zip" i]:visible'
-            )
 
-            # Fallback to GameStop's top-header store selector if the product pickup box is hidden
-            if zip_input.count() == 0:
-                header_store = page.locator(
-                    '[data-testid*="store" i]:visible, '
-                    '[class*="store-selector" i]:visible, '
-                    '[aria-label*="store" i]:visible'
+def check_gamestop(page, api_responses: list[str]) -> tuple[bool, str]:
+    """Checks GameStop's internal inventory API responses and local store status for Sierra Vista."""
+    try:
+        dismiss_popups(page)
+        set_and_search_gamestop_store(page)
+
+        # 1. Inspect captured JSON API responses for Sierra Vista / 480 N Highway 90 / 85635
+        for raw_json in api_responses:
+            lower_json = raw_json.lower()
+            if any(loc in lower_json for loc in ["480 n highway 90", "sierra vista", "85635"]):
+                # Extract the slice near the Sierra Vista store entry
+                idx = max(
+                    lower_json.find("480 n highway 90"),
+                    lower_json.find("sierra vista"),
+                    lower_json.find("85635"),
                 )
-                if header_store.count() > 0:
-                    try:
-                        header_store.first.click(timeout=2500)
-                        page.wait_for_timeout(1500)
-                    except Exception:
-                        pass
+                window = lower_json[max(0, idx - 300) : idx + 600]
 
-            if zip_input.count() > 0:
-                zip_input.first.fill(LOCAL_ZIP)
-                zip_input.first.press("Enter")
-                search_btn = page.locator("button:visible").filter(
-                    has_text=re.compile(r"^(search|find|submit|apply|update|check)$", re.I)
-                )
-                if search_btn.count() > 0:
-                    try:
-                        search_btn.first.click(timeout=2000)
-                    except Exception:
-                        pass
-                page.wait_for_timeout(2500)
+                if (
+                    '"instock":true' in window.replace(" ", "")
+                    or '"available":true' in window.replace(" ", "")
+                    or re.search(r'"ats"\s*:\s*[1-9]\d*', window)
+                    or re.search(r'"quantity"\s*:\s*[1-9]\d*', window)
+                    or any(p in window for p in ["in stock", "low stock", "limited stock"])
+                ):
+                    return True, "IN STOCK at 480 N Hwy 90 Byp!"
 
-                # Confirm "Make My Store" / "Select Store" if a store list modal opened
-                set_store_btn = page.locator("button:visible").filter(
-                    has_text=re.compile(r"(make my store|set as my store|set store|select store)", re.I)
-                )
-                if set_store_btn.count() > 0:
-                    try:
-                        set_store_btn.first.click(timeout=2000)
-                        page.wait_for_timeout(2000)
-                    except Exception:
-                        pass
+                if (
+                    '"instock":false' in window.replace(" ", "")
+                    or '"available":false' in window.replace(" ", "")
+                    or re.search(r'"ats"\s*:\s*0\b', window)
+                    or any(p in window for p in ["out of stock", "not available", "unavailable"])
+                ):
+                    return False, "Out of stock at 480 N Hwy 90 Byp"
 
-        # Locate the store card matching 480 N Highway 90 Byp / Sierra Vista
+        # 2. Check any visible store card/modal on the page for 480 N Highway 90 / Sierra Vista
         store_card_text = page.evaluate(
             """() => {
                 const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
@@ -200,46 +203,42 @@ def check_gamestop_local(page) -> tuple[bool, str]:
         )
 
         if store_card_text:
-            unavailable_phrases = [
-                "out of stock",
-                "unavailable",
-                "not available",
-                "sold out",
-            ]
-            if any(phrase in store_card_text for phrase in unavailable_phrases):
+            if any(p in store_card_text for p in ["out of stock", "unavailable", "not available", "sold out"]):
                 return False, "Out of stock at 480 N Hwy 90 Byp"
-
-            available_phrases = [
-                "in stock",
-                "low stock",
-                "pick up today",
-                "pick up in store",
-                "ready for pickup",
-                "available for pickup",
-            ]
-            if any(phrase in store_card_text for phrase in available_phrases):
+            if any(p in store_card_text for p in ["in stock", "low stock", "limited stock", "available"]):
                 return True, "IN STOCK at 480 N Hwy 90 Byp!"
 
-            return False, "Out of stock at 480 N Hwy 90 Byp"
+        # 3. Inspect the main product status button/badge for SKU 451607 (top of page only)
+        sku_btn = page.locator('button[data-pid="451607"]:visible')
+        if sku_btn.count() > 0:
+            label = sku_btn.first.inner_text().strip()
+            if re.search(r"^(add to cart|pre-order|buy now|in-store only|in stock)$", label, re.I):
+                return True, f"AVAILABLE ({label})!"
+            return False, f"Out of stock ({label})"
 
-        # If GameStop hides store pickup while an item is unlisted, report the main button status
-        status_btn = page.locator("button:visible").filter(
+        candidates = page.locator("button:visible").filter(
             has_text=re.compile(
-                r"(not available|coming soon|out of stock|sold out|pre-order|add to cart)",
+                r"^(add to cart|pre-order|buy now|in-store only|not available|coming soon|out of stock|sold out)$",
                 re.I,
             )
         )
-        if status_btn.count() > 0:
-            btn_label = status_btn.first.inner_text().strip()
-            return False, f"Out of stock (page shows: {btn_label})"
+        for i in range(min(candidates.count(), 6)):
+            btn = candidates.nth(i)
+            box = btn.bounding_box()
+            if not box or box["y"] > 950:
+                continue
+            label = btn.inner_text().strip()
+            if re.match(r"^(add to cart|pre-order|buy now|in-store only)$", label, re.I):
+                return True, f"AVAILABLE ({label})!"
+            return False, f"Out of stock ({label})"
 
-        return False, "Out of stock (pickup widget hidden)"
+        return False, "Out of stock"
 
     except Exception as err:
-        return False, f"Store check error ({err})"
+        return False, f"Check error ({err})"
 
 
-def is_in_stock(page, store_type: str) -> tuple[bool, str]:
+def is_in_stock(page, store_type: str, api_responses: list[str]) -> tuple[bool, str]:
     try:
         if store_type == "nintendo":
             btn = page.locator("button:visible").filter(
@@ -274,7 +273,7 @@ def is_in_stock(page, store_type: str) -> tuple[bool, str]:
             return found, ("IN STOCK!" if found else "Out of stock")
 
         if store_type == "gamestop":
-            return check_gamestop_local(page)
+            return check_gamestop(page, api_responses)
 
     except Exception:
         return False, "Out of stock"
@@ -286,6 +285,7 @@ def check_single_store(store: dict, result_queue: multiprocessing.Queue) -> None
     name = store["name"]
     url = store["url"]
     store_type = store["type"]
+    api_responses: list[str] = []
 
     try:
         with sync_playwright() as p:
@@ -320,6 +320,18 @@ def check_single_store(store: dict, result_queue: multiprocessing.Queue) -> None
                 lambda route: route.abort(),
             )
 
+            if store_type == "gamestop":
+                def capture_json(resp):
+                    try:
+                        if resp.status == 200 and resp.request.resource_type in ("xhr", "fetch"):
+                            ct = resp.headers.get("content-type", "")
+                            if "json" in ct or any(k in resp.url.lower() for k in ["store", "product", "avail", "invent"]):
+                                api_responses.append(resp.text()[:15000])
+                    except Exception:
+                        pass
+
+                page.on("response", capture_json)
+
             try:
                 response = page.goto(url, wait_until="domcontentloaded", timeout=14000)
                 page.wait_for_timeout(3500)
@@ -341,7 +353,7 @@ def check_single_store(store: dict, result_queue: multiprocessing.Queue) -> None
                 })
                 return
 
-            in_stock, detail = is_in_stock(page, store_type)
+            in_stock, detail = is_in_stock(page, store_type, api_responses)
             if in_stock:
                 result_queue.put({
                     "in_stock": True,
@@ -380,7 +392,7 @@ def check_all_stores() -> None:
         q = multiprocessing.Queue()
         proc = multiprocessing.Process(target=check_single_store, args=(store, q))
         proc.start()
-        proc.join(timeout=38 if store["type"] == "gamestop" else 28)
+        proc.join(timeout=35 if store["type"] == "gamestop" else 28)
 
         if proc.is_alive():
             proc.terminate()
