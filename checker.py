@@ -4,7 +4,8 @@ import sys
 import requests
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
 
-DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL")
+DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "").strip()
+EVENT_NAME = os.environ.get("EVENT_NAME", "").strip()
 
 STORES = [
     {
@@ -38,7 +39,7 @@ BLOCK_INDICATORS = [
 ]
 
 
-def send_notification(store_name: str, url: str) -> None:
+def send_stock_alert(store_name: str, url: str) -> None:
     payload = {
         "content": f"@everyone **Zelda 40th Switch 2** is in stock at **{store_name}**!\n{url}",
         "embeds": [
@@ -54,42 +55,68 @@ def send_notification(store_name: str, url: str) -> None:
     response.raise_for_status()
 
 
+def send_manual_summary(status_lines: list[str]) -> None:
+    payload = {
+        "embeds": [
+            {
+                "title": "Manual Stock Check Complete",
+                "description": "\n".join(status_lines),
+                "color": 3447003,
+            }
+        ],
+    }
+    response = requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=10)
+    response.raise_for_status()
+
+
 def is_in_stock(page, store_type: str) -> bool:
-    if store_type == "nintendo":
-        btn = page.locator("button:visible").filter(
-            has_text=re.compile(r"^(add to cart|pre-order)$", re.I)
-        )
-        return btn.count() > 0 and btn.first.is_enabled()
+    try:
+        if store_type == "nintendo":
+            btn = page.locator("button:visible").filter(
+                has_text=re.compile(r"^(add to cart|pre-order)$", re.I)
+            )
+            return btn.count() > 0 and btn.first.is_enabled(timeout=3000)
 
-    if store_type == "bestbuy":
-        btn = page.locator(
-            'button[data-button-state="ADD_TO_CART"]:visible, '
-            'button[data-button-state="PRE_ORDER"]:visible, '
-            '.fulfillment-add-to-cart-button button:visible'
-        ).filter(has_text=re.compile(r"(add to cart|pre-order)", re.I))
-        return btn.count() > 0 and btn.first.is_enabled()
+        if store_type == "bestbuy":
+            btn = page.locator(
+                'button[data-button-state="ADD_TO_CART"]:visible, '
+                'button[data-button-state="PRE_ORDER"]:visible, '
+                '.fulfillment-add-to-cart-button button:visible'
+            ).filter(has_text=re.compile(r"(add to cart|pre-order)", re.I))
+            return btn.count() > 0 and btn.first.is_enabled(timeout=3000)
 
-    if store_type == "target":
-        btn = page.locator(
-            'button[data-test="shippingButton"]:visible, '
-            'button[data-test="orderPickupButton"]:visible, '
-            'button[data-test="deliveryButton"]:visible'
-        )
-        return btn.count() > 0 and btn.first.is_enabled()
+        if store_type == "target":
+            btn = page.locator(
+                'button[data-test="shippingButton"]:visible, '
+                'button[data-test="orderPickupButton"]:visible, '
+                'button[data-test="deliveryButton"]:visible'
+            )
+            return btn.count() > 0 and btn.first.is_enabled(timeout=3000)
 
-    if store_type == "amazon":
-        btn = page.locator(
-            "#add-to-cart-button:visible, #buy-now-button:visible"
-        )
-        return btn.count() > 0 and btn.first.is_enabled()
+        if store_type == "amazon":
+            btn = page.locator(
+                "#add-to-cart-button:visible, #buy-now-button:visible"
+            )
+            return btn.count() > 0 and btn.first.is_enabled(timeout=3000)
+    except Exception:
+        return False
 
     return False
 
 
+def get_safe_html(page) -> str:
+    try:
+        return page.content()[:5000].lower()
+    except Exception:
+        return ""
+
+
 def check_all_stores() -> None:
     if not DISCORD_WEBHOOK_URL:
-        print("Missing DISCORD_WEBHOOK_URL environment variable.")
+        print("Missing DISCORD_WEBHOOK_URL environment variable.", flush=True)
         sys.exit(1)
+
+    status_report = []
 
     with sync_playwright() as p:
         browser = p.chromium.launch(
@@ -108,6 +135,7 @@ def check_all_stores() -> None:
             viewport={"width": 1366, "height": 768},
             locale="en-US",
         )
+        context.set_default_timeout(5000)
         context.add_init_script(
             "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
         )
@@ -116,41 +144,57 @@ def check_all_stores() -> None:
             name = store["name"]
             url = store["url"]
             store_type = store["type"]
+            print(f"[{name}] Checking...", flush=True)
             page = None
+            timed_out = False
 
             try:
                 page = context.new_page()
-                wait_mode = "commit" if store_type == "bestbuy" else "domcontentloaded"
-                response = page.goto(url, wait_until=wait_mode, timeout=30000)
-                page.wait_for_timeout(6000 if store_type == "bestbuy" else 4000)
+                response = page.goto(url, wait_until="domcontentloaded", timeout=15000)
+                page.wait_for_timeout(4000)
 
                 status = response.status if response else "No response"
-                title = page.title().lower()
-                body_snippet = page.locator("body").inner_text()[:1500].lower()
+                html_snippet = get_safe_html(page)
 
-                if any(flag in title or flag in body_snippet for flag in BLOCK_INDICATORS):
-                    print(f"[{name}] BLOCKED / CAPTCHA detected (HTTP {status}).")
+                if any(flag in html_snippet for flag in BLOCK_INDICATORS):
+                    print(f"[{name}] BLOCKED / CAPTCHA detected (HTTP {status}).", flush=True)
+                    status_report.append(f"• **{name}**: Blocked / CAPTCHA (HTTP {status})")
                     continue
 
                 if is_in_stock(page, store_type):
-                    print(f"[{name}] IN STOCK! Sending Discord alert...")
-                    send_notification(name, url)
+                    print(f"[{name}] IN STOCK! Sending Discord alert...", flush=True)
+                    send_stock_alert(name, url)
+                    status_report.append(f"• **{name}**: **IN STOCK!**")
                 else:
-                    print(f"[{name}] Out of stock (HTTP {status}).")
+                    print(f"[{name}] Out of stock (HTTP {status}).", flush=True)
+                    status_report.append(f"• **{name}**: Out of stock")
 
             except PlaywrightTimeout:
+                timed_out = True
                 if page and is_in_stock(page, store_type):
-                    print(f"[{name}] IN STOCK! Sending Discord alert...")
-                    send_notification(name, url)
+                    print(f"[{name}] IN STOCK! Sending Discord alert...", flush=True)
+                    send_stock_alert(name, url)
+                    status_report.append(f"• **{name}**: **IN STOCK!**")
                 else:
-                    print(f"[{name}] Timed out loading page (store may be blocking cloud IPs).")
+                    print(f"[{name}] Timed out loading page.", flush=True)
+                    status_report.append(f"• **{name}**: Timed out")
             except Exception as err:
-                print(f"[{name}] Error: {err}")
+                print(f"[{name}] Error: {err}", flush=True)
+                status_report.append(f"• **{name}**: Error")
             finally:
-                if page:
-                    page.close()
+                if page and not timed_out:
+                    try:
+                        page.close()
+                    except Exception:
+                        pass
 
-        browser.close()
+        if EVENT_NAME == "workflow_dispatch":
+            print("Manual run detected. Sending summary to Discord...", flush=True)
+            send_manual_summary(status_report)
+
+        print("All checks finished.", flush=True)
+        sys.stdout.flush()
+        os._exit(0)
 
 
 if __name__ == "__main__":
