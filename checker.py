@@ -8,9 +8,9 @@ from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeo
 DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "").strip()
 EVENT_NAME = os.environ.get("EVENT_NAME", "").strip()
 
-# Sierra Vista, AZ coordinates & ZIP for local store pickup checks
+# Exact location for 480 N Highway 90 Byp Ste A3, Sierra Vista, AZ 85635
 LOCAL_ZIP = "85635"
-LOCAL_COORDS = {"latitude": 31.5546, "longitude": -110.2584}
+LOCAL_COORDS = {"latitude": 31.5586, "longitude": -110.2564}
 
 STORES = [
     {
@@ -34,7 +34,7 @@ STORES = [
         "type": "amazon",
     },
     {
-        "name": "GameStop (Sierra Vista)",
+        "name": "GameStop (480 N Hwy 90 Byp, Sierra Vista)",
         "url": "https://www.gamestop.com/consoles-hardware/nintendo-switch-2/products/nintendo-switch-2-the-legend-of-zelda-40th-anniversary-edition/451607.html",
         "type": "gamestop",
     },
@@ -81,51 +81,115 @@ def send_manual_summary(status_lines: list[str]) -> None:
     response.raise_for_status()
 
 
+def dismiss_popups(page) -> None:
+    for selector in [
+        "#onetrust-accept-btn-handler",
+        'button:has-text("Accept All")',
+        'button[aria-label*="close" i]',
+    ]:
+        try:
+            btn = page.locator(selector).first
+            if btn.is_visible(timeout=700):
+                btn.click(timeout=1000)
+                page.wait_for_timeout(400)
+        except Exception:
+            pass
+
+
 def check_gamestop_local(page) -> tuple[bool, str]:
-    """Selects Sierra Vista (85635) on GameStop and checks local store pickup status."""
+    """Selects 480 N Highway 90 Byp Ste A3, Sierra Vista, AZ 85635 and checks pickup status."""
     try:
+        dismiss_popups(page)
+
+        # Activate the "Pick Up in Store" fulfillment option if it is collapsed/unselected
+        pickup_tab = page.locator(
+            'button:visible, label:visible, [role="radio"]:visible, [role="tab"]:visible'
+        ).filter(has_text=re.compile(r"(pick up in store|store pickup|free store pickup)", re.I))
+        if pickup_tab.count() > 0:
+            try:
+                pickup_tab.first.click(timeout=2000)
+                page.wait_for_timeout(1200)
+            except Exception:
+                pass
+
         body_text = page.locator("body").inner_text().lower()
 
-        # If Sierra Vista isn't already auto-selected via GPS, open the store finder and enter 85635
-        if "sierra vista" not in body_text:
-            store_triggers = page.locator("button:visible, a:visible").filter(
+        if "480 n highway 90" not in body_text and "sierra vista" not in body_text:
+            store_triggers = page.locator('button:visible, [role="button"]:visible').filter(
                 has_text=re.compile(
-                    r"(pick up|change store|check other stores|select a store|find a store)",
+                    r"(select a store|set store|change store|check other stores|check availability|find a store)",
                     re.I,
                 )
             )
             if store_triggers.count() > 0:
-                store_triggers.first.click(timeout=3000)
-                page.wait_for_timeout(1500)
+                try:
+                    store_triggers.first.click(timeout=3000)
+                    page.wait_for_timeout(1500)
+                except Exception:
+                    pass
 
             zip_input = page.locator(
                 'input[placeholder*="zip" i]:visible, '
+                'input[placeholder*="city" i]:visible, '
                 'input[placeholder*="postal" i]:visible, '
                 'input[name*="zip" i]:visible, '
-                'input[name*="postal" i]:visible, '
                 'input[id*="zip" i]:visible, '
                 'input[aria-label*="zip" i]:visible'
             )
+
+            # Fallback to GameStop's top-header store selector if the product pickup box is hidden
+            if zip_input.count() == 0:
+                header_store = page.locator(
+                    '[data-testid*="store" i]:visible, '
+                    '[class*="store-selector" i]:visible, '
+                    '[aria-label*="store" i]:visible'
+                )
+                if header_store.count() > 0:
+                    try:
+                        header_store.first.click(timeout=2500)
+                        page.wait_for_timeout(1500)
+                    except Exception:
+                        pass
+
             if zip_input.count() > 0:
                 zip_input.first.fill(LOCAL_ZIP)
                 zip_input.first.press("Enter")
                 search_btn = page.locator("button:visible").filter(
-                    has_text=re.compile(r"^(search|find|submit|apply|update)$", re.I)
+                    has_text=re.compile(r"^(search|find|submit|apply|update|check)$", re.I)
                 )
                 if search_btn.count() > 0:
-                    search_btn.first.click(timeout=2000)
-                page.wait_for_timeout(3000)
+                    try:
+                        search_btn.first.click(timeout=2000)
+                    except Exception:
+                        pass
+                page.wait_for_timeout(2500)
 
-        # Inspect the store card/container that specifically mentions Sierra Vista
+                # Confirm "Make My Store" / "Select Store" if a store list modal opened
+                set_store_btn = page.locator("button:visible").filter(
+                    has_text=re.compile(r"(make my store|set as my store|set store|select store)", re.I)
+                )
+                if set_store_btn.count() > 0:
+                    try:
+                        set_store_btn.first.click(timeout=2000)
+                        page.wait_for_timeout(2000)
+                    except Exception:
+                        pass
+
+        # Locate the store card matching 480 N Highway 90 Byp / Sierra Vista
         store_card_text = page.evaluate(
             """() => {
                 const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
                 let node;
                 while ((node = walker.nextNode())) {
-                    if (node.nodeValue && node.nodeValue.toLowerCase().includes('sierra vista')) {
+                    const txt = (node.nodeValue || '').toLowerCase();
+                    if (
+                        txt.includes('480 n highway 90') ||
+                        txt.includes('highway 90 byp') ||
+                        txt.includes('sierra vista')
+                    ) {
                         let el = node.parentElement;
-                        for (let i = 0; i < 5 && el && el.parentElement; i++) {
-                            if (el.innerText && el.innerText.length > 40) break;
+                        for (let i = 0; i < 6 && el && el.parentElement; i++) {
+                            if (el.innerText && el.innerText.length > 50) break;
                             el = el.parentElement;
                         }
                         return el ? el.innerText.toLowerCase() : '';
@@ -135,30 +199,41 @@ def check_gamestop_local(page) -> tuple[bool, str]:
             }"""
         )
 
-        if not store_card_text:
-            return False, "Sierra Vista store not shown"
+        if store_card_text:
+            unavailable_phrases = [
+                "out of stock",
+                "unavailable",
+                "not available",
+                "sold out",
+            ]
+            if any(phrase in store_card_text for phrase in unavailable_phrases):
+                return False, "Out of stock at 480 N Hwy 90 Byp"
 
-        unavailable_phrases = [
-            "out of stock",
-            "unavailable",
-            "not available",
-            "sold out",
-        ]
-        if any(phrase in store_card_text for phrase in unavailable_phrases):
-            return False, "Out of stock at Sierra Vista"
+            available_phrases = [
+                "in stock",
+                "low stock",
+                "pick up today",
+                "pick up in store",
+                "ready for pickup",
+                "available for pickup",
+            ]
+            if any(phrase in store_card_text for phrase in available_phrases):
+                return True, "IN STOCK at 480 N Hwy 90 Byp!"
 
-        available_phrases = [
-            "in stock",
-            "low stock",
-            "pick up today",
-            "pick up in store",
-            "ready for pickup",
-            "available for pickup",
-        ]
-        if any(phrase in store_card_text for phrase in available_phrases):
-            return True, "IN STOCK at Sierra Vista!"
+            return False, "Out of stock at 480 N Hwy 90 Byp"
 
-        return False, "Out of stock at Sierra Vista"
+        # If GameStop hides store pickup while an item is unlisted, report the main button status
+        status_btn = page.locator("button:visible").filter(
+            has_text=re.compile(
+                r"(not available|coming soon|out of stock|sold out|pre-order|add to cart)",
+                re.I,
+            )
+        )
+        if status_btn.count() > 0:
+            btn_label = status_btn.first.inner_text().strip()
+            return False, f"Out of stock (page shows: {btn_label})"
+
+        return False, "Out of stock (pickup widget hidden)"
 
     except Exception as err:
         return False, f"Store check error ({err})"
@@ -305,14 +380,14 @@ def check_all_stores() -> None:
         q = multiprocessing.Queue()
         proc = multiprocessing.Process(target=check_single_store, args=(store, q))
         proc.start()
-        proc.join(timeout=28)
+        proc.join(timeout=38 if store["type"] == "gamestop" else 28)
 
         if proc.is_alive():
             proc.terminate()
             proc.join(timeout=3)
             if proc.is_alive():
                 proc.kill()
-            print(f"[{name}] Timed out (hard stop after 28s).", flush=True)
+            print(f"[{name}] Timed out (hard stop).", flush=True)
             status_report.append(f"• **{name}**: Timed out (blocked cloud IP)")
         elif not q.empty():
             res = q.get_nowait()
