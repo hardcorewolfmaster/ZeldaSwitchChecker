@@ -8,6 +8,10 @@ from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeo
 DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "").strip()
 EVENT_NAME = os.environ.get("EVENT_NAME", "").strip()
 
+# Sierra Vista, AZ coordinates & ZIP for local store pickup checks
+LOCAL_ZIP = "85635"
+LOCAL_COORDS = {"latitude": 31.5546, "longitude": -110.2584}
+
 STORES = [
     {
         "name": "Nintendo Store",
@@ -29,6 +33,11 @@ STORES = [
         "url": "https://www.amazon.com/dp/B0HJ6F8L6V",
         "type": "amazon",
     },
+    {
+        "name": "GameStop (Sierra Vista)",
+        "url": "https://www.gamestop.com/consoles-hardware/nintendo-switch-2/products/nintendo-switch-2-the-legend-of-zelda-40th-anniversary-edition/451607.html",
+        "type": "gamestop",
+    },
 ]
 
 BLOCK_INDICATORS = [
@@ -38,6 +47,7 @@ BLOCK_INDICATORS = [
     "enter the characters you see below",
     "pardon our interruption",
     "sorry, we just need to make sure you're not a robot",
+    "attention required! | cloudflare",
 ]
 
 
@@ -71,13 +81,97 @@ def send_manual_summary(status_lines: list[str]) -> None:
     response.raise_for_status()
 
 
-def is_in_stock(page, store_type: str) -> bool:
+def check_gamestop_local(page) -> tuple[bool, str]:
+    """Selects Sierra Vista (85635) on GameStop and checks local store pickup status."""
+    try:
+        body_text = page.locator("body").inner_text().lower()
+
+        # If Sierra Vista isn't already auto-selected via GPS, open the store finder and enter 85635
+        if "sierra vista" not in body_text:
+            store_triggers = page.locator("button:visible, a:visible").filter(
+                has_text=re.compile(
+                    r"(pick up|change store|check other stores|select a store|find a store)",
+                    re.I,
+                )
+            )
+            if store_triggers.count() > 0:
+                store_triggers.first.click(timeout=3000)
+                page.wait_for_timeout(1500)
+
+            zip_input = page.locator(
+                'input[placeholder*="zip" i]:visible, '
+                'input[placeholder*="postal" i]:visible, '
+                'input[name*="zip" i]:visible, '
+                'input[name*="postal" i]:visible, '
+                'input[id*="zip" i]:visible, '
+                'input[aria-label*="zip" i]:visible'
+            )
+            if zip_input.count() > 0:
+                zip_input.first.fill(LOCAL_ZIP)
+                zip_input.first.press("Enter")
+                search_btn = page.locator("button:visible").filter(
+                    has_text=re.compile(r"^(search|find|submit|apply|update)$", re.I)
+                )
+                if search_btn.count() > 0:
+                    search_btn.first.click(timeout=2000)
+                page.wait_for_timeout(3000)
+
+        # Inspect the store card/container that specifically mentions Sierra Vista
+        store_card_text = page.evaluate(
+            """() => {
+                const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+                let node;
+                while ((node = walker.nextNode())) {
+                    if (node.nodeValue && node.nodeValue.toLowerCase().includes('sierra vista')) {
+                        let el = node.parentElement;
+                        for (let i = 0; i < 5 && el && el.parentElement; i++) {
+                            if (el.innerText && el.innerText.length > 40) break;
+                            el = el.parentElement;
+                        }
+                        return el ? el.innerText.toLowerCase() : '';
+                    }
+                }
+                return null;
+            }"""
+        )
+
+        if not store_card_text:
+            return False, "Sierra Vista store not shown"
+
+        unavailable_phrases = [
+            "out of stock",
+            "unavailable",
+            "not available",
+            "sold out",
+        ]
+        if any(phrase in store_card_text for phrase in unavailable_phrases):
+            return False, "Out of stock at Sierra Vista"
+
+        available_phrases = [
+            "in stock",
+            "low stock",
+            "pick up today",
+            "pick up in store",
+            "ready for pickup",
+            "available for pickup",
+        ]
+        if any(phrase in store_card_text for phrase in available_phrases):
+            return True, "IN STOCK at Sierra Vista!"
+
+        return False, "Out of stock at Sierra Vista"
+
+    except Exception as err:
+        return False, f"Store check error ({err})"
+
+
+def is_in_stock(page, store_type: str) -> tuple[bool, str]:
     try:
         if store_type == "nintendo":
             btn = page.locator("button:visible").filter(
                 has_text=re.compile(r"^(add to cart|pre-order)$", re.I)
             )
-            return btn.count() > 0 and btn.first.is_enabled(timeout=3000)
+            found = btn.count() > 0 and btn.first.is_enabled(timeout=3000)
+            return found, ("IN STOCK!" if found else "Out of stock")
 
         if store_type == "bestbuy":
             btn = page.locator(
@@ -85,7 +179,8 @@ def is_in_stock(page, store_type: str) -> bool:
                 'button[data-button-state="PRE_ORDER"]:visible, '
                 '.fulfillment-add-to-cart-button button:visible'
             ).filter(has_text=re.compile(r"(add to cart|pre-order)", re.I))
-            return btn.count() > 0 and btn.first.is_enabled(timeout=3000)
+            found = btn.count() > 0 and btn.first.is_enabled(timeout=3000)
+            return found, ("IN STOCK!" if found else "Out of stock")
 
         if store_type == "target":
             btn = page.locator(
@@ -93,17 +188,23 @@ def is_in_stock(page, store_type: str) -> bool:
                 'button[data-test="orderPickupButton"]:visible, '
                 'button[data-test="deliveryButton"]:visible'
             )
-            return btn.count() > 0 and btn.first.is_enabled(timeout=3000)
+            found = btn.count() > 0 and btn.first.is_enabled(timeout=3000)
+            return found, ("IN STOCK!" if found else "Out of stock")
 
         if store_type == "amazon":
             btn = page.locator(
                 "#add-to-cart-button:visible, #buy-now-button:visible"
             )
-            return btn.count() > 0 and btn.first.is_enabled(timeout=3000)
-    except Exception:
-        return False
+            found = btn.count() > 0 and btn.first.is_enabled(timeout=3000)
+            return found, ("IN STOCK!" if found else "Out of stock")
 
-    return False
+        if store_type == "gamestop":
+            return check_gamestop_local(page)
+
+    except Exception:
+        return False, "Out of stock"
+
+    return False, "Out of stock"
 
 
 def check_single_store(store: dict, result_queue: multiprocessing.Queue) -> None:
@@ -130,6 +231,8 @@ def check_single_store(store: dict, result_queue: multiprocessing.Queue) -> None
                 ),
                 viewport={"width": 1366, "height": 768},
                 locale="en-US",
+                geolocation=LOCAL_COORDS,
+                permissions=["geolocation"],
             )
             context.set_default_timeout(5000)
             context.add_init_script(
@@ -137,7 +240,6 @@ def check_single_store(store: dict, result_queue: multiprocessing.Queue) -> None
             )
 
             page = context.new_page()
-            # Block heavy media/fonts so pages load fast and don't stall memory
             page.route(
                 re.compile(r"\.(png|jpg|jpeg|gif|webp|svg|mp4|woff|woff2)(\?.*)?$", re.I),
                 lambda route: route.abort(),
@@ -164,17 +266,18 @@ def check_single_store(store: dict, result_queue: multiprocessing.Queue) -> None
                 })
                 return
 
-            if is_in_stock(page, store_type):
+            in_stock, detail = is_in_stock(page, store_type)
+            if in_stock:
                 result_queue.put({
                     "in_stock": True,
-                    "log": f"[{name}] IN STOCK! Sending Discord alert...",
-                    "summary": f"• **{name}**: **IN STOCK!**",
+                    "log": f"[{name}] {detail} Sending Discord alert...",
+                    "summary": f"• **{name}**: **{detail}**",
                 })
             else:
                 result_queue.put({
                     "in_stock": False,
-                    "log": f"[{name}] Out of stock (HTTP {status}).",
-                    "summary": f"• **{name}**: Out of stock",
+                    "log": f"[{name}] {detail} (HTTP {status}).",
+                    "summary": f"• **{name}**: {detail}",
                 })
 
             browser.close()
@@ -202,14 +305,14 @@ def check_all_stores() -> None:
         q = multiprocessing.Queue()
         proc = multiprocessing.Process(target=check_single_store, args=(store, q))
         proc.start()
-        proc.join(timeout=22)
+        proc.join(timeout=28)
 
         if proc.is_alive():
             proc.terminate()
             proc.join(timeout=3)
             if proc.is_alive():
                 proc.kill()
-            print(f"[{name}] Timed out (hard stop after 22s).", flush=True)
+            print(f"[{name}] Timed out (hard stop after 28s).", flush=True)
             status_report.append(f"• **{name}**: Timed out (blocked cloud IP)")
         elif not q.empty():
             res = q.get_nowait()
