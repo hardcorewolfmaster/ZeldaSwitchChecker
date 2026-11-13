@@ -94,7 +94,10 @@ def check_all_stores() -> None:
     with sync_playwright() as p:
         browser = p.chromium.launch(
             headless=True,
-            args=["--disable-blink-features=AutomationControlled"],
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--disable-http2",
+            ],
         )
         context = browser.new_context(
             user_agent=(
@@ -105,14 +108,18 @@ def check_all_stores() -> None:
             viewport={"width": 1366, "height": 768},
             locale="en-US",
         )
-        page = context.new_page()
+        context.add_init_script(
+            "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
+        )
 
         for store in STORES:
             name = store["name"]
             url = store["url"]
             store_type = store["type"]
+            page = None
 
             try:
+                page = context.new_page()
                 response = page.goto(url, wait_until="domcontentloaded", timeout=30000)
                 page.wait_for_timeout(4000)
 
@@ -134,6 +141,9 @@ def check_all_stores() -> None:
                 print(f"[{name}] Timed out loading page.")
             except Exception as err:
                 print(f"[{name}] Error: {err}")
+            finally:
+                if page:
+                    page.close()
 
         browser.close()
 
